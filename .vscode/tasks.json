@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+  ],
+  "tasks": [
+    {
+      "label": "cosmos-sdk-validator-playbook: Check whether the hosts are online",
+      "type": "process",
+      "command": "ansible",
+      "args": [
+        "-i",
+        "${workspaceFolder}/inventory",
+        "validators",
+        "-m",
+        "ping"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "clear": true,
+        "showReuseMessage": false
+      }
+    },
+    {
+      "label": "cosmos-sdk-validator-playbook: Run the cosmos_sdk_validator_playbook playbook",
+      "type": "process",
+      "command": "ansible-playbook",
+      "args": [
+        "-i",
+        "${workspaceFolder}/inventory",
+        "cosmos_sdk_validator_playbook.yml"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "clear": true,
+        "showReuseMessage": false
+      }
+    }
+  ]
+}

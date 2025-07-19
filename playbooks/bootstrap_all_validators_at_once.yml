@@ -1,0 +1,201 @@
+---
+- name: bootstrap_all_validators_at_once
+  # TODO: Rename this playbook to better indicate its purpose for setting up a private testnet
+  hosts: validators
+  vars_prompt:
+    - name: config__chain_id
+      prompt: "Enter the chain ID"
+      private: false
+      unsafe: true
+    - name: config__keyring_password
+      prompt: "Enter the keyring password"
+      private: true
+      unsafe: true
+  vars:
+    remote__gaiad_file_destination: /home/ubuntu/gaiad
+    remote__gaiad_home_destination: /home/ubuntu/.gaiad
+    local__gaiad_file: ../upload_files/bootstrap_all_validators_at_once/gaiad
+    local__gaiad_config_diff: ../upload_files/bootstrap_all_validators_at_once/gaiad_config.sample.diff
+  tasks:
+    - name: Print introduction
+      ansible.builtin.debug:
+        msg: "Running cosmos_sdk_validator_playbook on {{ ansible_host }}."
+    # Pre-checks
+    - name: Whether remote__gaiad_home_destination is already present
+      stat:
+        path: "{{ remote__gaiad_home_destination }}"
+      register: remote__gaiad_home_destination_exists
+    - name: Fail-safe logic when gaiad configuration directory is already present
+      fail:
+        msg: "Gaiad configuration directory already exists at {{ remote__gaiad_home_destination }}. Please remove it or use a different path."
+      when: remote__gaiad_home_destination_exists.stat.exists
+    - name: Ensure there are no 26657 port in use
+      ansible.builtin.command: lsof -i :26657
+      register: port_check
+      ignore_errors: true
+      failed_when: false
+    - name: Fail-safe logic when port 26657 is already in use
+      fail:
+        msg: "Port 26657 is already in use. Please stop the service using this port before continuing."
+      when: port_check.stdout != ""
+    # Pre-bootstrap tasks
+    - name: Add IP address of all validators
+      become: true
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '.*{{ item }}$'
+        line: "{{ hostvars[item].ansible_host }} {{item}}"
+        state: present
+      when: hostvars[item].ansible_host is defined
+      with_items: "{{ groups.validators }}"
+    - name: Check if gaiad binary already exists
+      stat:
+        path: "{{ remote__gaiad_file_destination }}"
+      register: gaiad_exists
+    - name: Copy gaiad binary to remote
+      copy:
+        src: "{{ local__gaiad_file }}"
+        dest: "{{ remote__gaiad_file_destination }}"
+        mode: '0755'
+      when: local__gaiad_file is defined and not gaiad_exists.stat.exists
+    - name: Prepare temporary directory for merging genesis files in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0]
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: genesis_merge
+      register: tempdir
+    - name: Prepare scripts in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0]
+      copy:
+        src: ../scripts/bootstrap_all_validators_at_once/
+        dest: "{{ tempdir.path }}/"
+    # Bootstrap tasks
+    - name: 1. gaiad init
+      command: "{{ remote__gaiad_file_destination }} init {{ inventory_hostname }} --chain-id {{ config__chain_id }} --home {{ remote__gaiad_home_destination }}"
+      args:
+        creates: "{{ remote__gaiad_home_destination }}/config/genesis.json"
+
+    - name: 1.1 Copy gaiad config diff to remote
+      copy:
+        src: "{{ local__gaiad_config_diff }}"
+        dest: "{{ remote__gaiad_home_destination }}/config/config.diff"
+    - name: 1.1. Apply gaiad configuration diff
+      shell: "patch -p1 < config.diff"
+      args:
+        chdir: "{{ remote__gaiad_home_destination }}/config"
+
+    - name: 2. "gaiad keys add"
+      shell: "yes \"{{ config__keyring_password }}\" | {{ remote__gaiad_file_destination }} keys add {{ inventory_hostname }} --home {{ remote__gaiad_home_destination }} --keyring-backend file"
+      register: keyring_add_results
+
+    - name: 3. "gaiad genesis add-genesis-account _ 1234567890stake"
+      shell: "yes \"{{ config__keyring_password }}\" | {{ remote__gaiad_file_destination }} genesis add-genesis-account {{ inventory_hostname }} 1234567890stake --home {{ remote__gaiad_home_destination }} --keyring-backend file"
+
+    - name: 4. "gaiad genesis gentx _ 1000000000stake"
+      shell: "yes \"{{ config__keyring_password }}\" | {{ remote__gaiad_file_destination }} genesis gentx {{ inventory_hostname }} 1000000000stake --home {{ remote__gaiad_home_destination }} --keyring-backend file"
+
+    - name: 5.1. gather "genesis.json" for accounts, balances, supply -- copy
+      when: groups['validators'] | length > 1
+      slurp:
+        src: "{{ remote__gaiad_home_destination }}/config/genesis.json"
+      register: genesis_json
+      # NOTE: replace this step to use stdout of the above command?
+    - name: 5.2. gather "genesis.json" for accounts, balances, supply -- pastes in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0] and item != inventory_hostname and groups['validators'] | length > 1
+      with_items: "{{ groups['validators'] }}"
+      copy:
+        content: "{{ hostvars[item].genesis_json.content | b64decode }}"
+        dest: "{{ tempdir.path }}/{{ item }}.json"
+        mode: '0644'
+    - name: 5.3. run genesis_merger script -- in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0] and groups['validators'] | length > 1
+      command: "python3 {{ tempdir.path }}/genesis_merger.py {{ remote__gaiad_home_destination }}/config/genesis.json {{ tempdir.path }}"
+
+    - name: 6.1. gather "gentx.json" -- locate
+      find:
+        paths: "{{ remote__gaiad_home_destination }}/config/gentx"
+        patterns: "*.json"
+      register: gentx_file_location
+    - name: 6.2. gather "gentx.json" -- copy
+      slurp:
+        src: "{{ gentx_file_location.files[0].path }}"
+      register: gentx_file
+    - name: 6.3. gather "gentx.json" -- pastes in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0] and item != inventory_hostname and groups['validators'] | length > 1
+      with_items: "{{ groups['validators'] }}"
+      copy:
+        content: "{{ hostvars[item].gentx_file.content | b64decode }}"
+        dest: "{{ remote__gaiad_home_destination }}/config/gentx/{{ item }}.json"
+
+    - name: 7.1. "gaiad genesis collect-gentxs" in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0] # NOTE: groups['validators'] | length == 1 should be run though.
+      command: "{{ remote__gaiad_file_destination }} genesis collect-gentxs --home {{ remote__gaiad_home_destination }}"
+    - name: 7.2. "gaiad genesis collect-gentxs" in primary node -- slurp
+      run_once: true
+      when: inventory_hostname == groups['validators'][0] and groups['validators'] | length > 1
+      slurp:
+        src: "{{ remote__gaiad_home_destination }}/config/genesis.json"
+      register: final_genesis_json
+
+    - name: 8. Distribute "genesis.json" to all nodes
+      when: inventory_hostname != groups['validators'][0] and groups['validators'] | length > 1
+      copy:
+        content: "{{ hostvars[groups['validators'][0]].final_genesis_json.content | b64decode }}"
+        dest: "{{ remote__gaiad_home_destination }}/config/genesis.json"
+
+    - name: 9.1. Update "persistent_peers" - extract peers from genesis.json in primary node
+      run_once: true
+      when: inventory_hostname == groups['validators'][0] and groups['validators'] | length > 1
+      command: "python3 {{ tempdir.path }}/genesis_extract_peers.py {{ remote__gaiad_home_destination }}/config/genesis.json"
+      register: persistent_peers_output
+    - name: 9.2. Update "persistent_peers" - apply to all other validators
+      when: groups['validators'] | length > 1
+      lineinfile:
+        path: "{{ remote__gaiad_home_destination }}/config/config.toml"
+        regexp: '^persistent_peers ='
+        line: "persistent_peers = \"{{ hostvars[groups['validators'][0]].persistent_peers_output.stdout | default('') }}\""
+
+    - name: 10.1. create gaiad service file
+      become: true
+      copy:
+        dest: /etc/systemd/system/gaiad.service
+        content: |
+          [Unit]
+          Description=Gaia Node
+          After=network.target
+
+          [Service]
+          User={{ ansible_user }}
+          ExecStart={{ remote__gaiad_file_destination }} start --home {{ remote__gaiad_home_destination }}
+          Restart=on-failure
+          RestartSec=3
+          LimitNOFILE=4096
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: 10.2. Reload systemd to recognize the new service
+      become: true
+      systemd:
+        daemon_reload: true
+
+    - name: 10.3. Start and enable gaiad service
+      become: true
+      systemd:
+        name: gaiad
+        state: started
+        enabled: true
+
+    - name: 10.4. Wait for gaiad service to be active
+      become: true
+      wait_for:
+        port: 26657
+        delay: 10
+        timeout: 60
+        state: started
